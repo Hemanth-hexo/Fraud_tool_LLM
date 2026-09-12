@@ -17,7 +17,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 
 sys.path.insert(0, str(Path(__file__).parent))
 from prompt import build_messages, build_target
@@ -139,6 +139,8 @@ def main():
     parser.add_argument("--max-eval-samples", type=int, default=None)
     parser.add_argument("--logging-steps", type=int, default=10)
     parser.add_argument("--save-steps", type=int, default=200)
+    parser.add_argument("--resume-adapter", type=Path, default=None,
+                         help="Continue training an existing LoRA adapter instead of starting a fresh one.")
     args = parser.parse_args()
 
     device = pick_device(args.device)
@@ -150,15 +152,19 @@ def main():
 
     model = load_model(args, device)
 
-    lora_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=TARGET_MODULES,
-    )
-    model = get_peft_model(model, lora_config)
+    if args.resume_adapter:
+        model = PeftModel.from_pretrained(model, str(args.resume_adapter), is_trainable=True)
+        print(f"Resumed LoRA adapter from {args.resume_adapter}")
+    else:
+        lora_config = LoraConfig(
+            r=16,
+            lora_alpha=32,
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=TARGET_MODULES,
+        )
+        model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
     train_dataset = ToolPlanDataset(args.train_file, tokenizer, args.max_length)
