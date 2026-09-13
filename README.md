@@ -48,7 +48,7 @@ run -- oversampling that case 3x and resuming from the v1 adapter via
 exact match, with the one remaining miss a reasonable near-confusion on an
 IP (`192.122.90.30`) that superficially resembles the trigger IP.
 
-## Phase 3 — custom inference engine (in progress)
+## Phase 3 — custom inference engine (done)
 
 `engine/cache.py` + `engine/generate.py`: a manual autoregressive decode loop
 -- no `model.generate()`. We create the `DynamicCache` ourselves, run one
@@ -132,7 +132,32 @@ base model, 0/20 exact match, exactly as expected: picking the right tools
 is a training problem, not a decoding one -- constrained decoding only
 guarantees the shape of the answer, not its correctness.)
 
-**Still to build:** the benchmark suite (latency, throughput, memory;
-constrained vs. unconstrained; quantized vs. fp16 -- using CPU int8 dynamic
-quantization as the comparison point in place of QLoRA/bitsandbytes, which
-doesn't run on Apple Silicon). See PLAN.md.
+### Benchmarks
+
+`engine/benchmark.py` covers what `verify_batch.py` didn't already measure:
+constrained-decoding overhead, KV-cache memory footprint, and a quantization
+comparison. On quantization: PLAN.md's "quantized vs. fp16" means QLoRA /
+`bitsandbytes` 4-bit, which is CUDA-only and doesn't run on Apple Silicon --
+CPU int8 dynamic quantization (`torch.quantization.quantize_dynamic`, on the
+`qnnpack` backend, the only quantized-kernel backend this Mac actually has)
+is the same-machine stand-in.
+
+```bash
+python3 engine/benchmark.py --n 10 --max-new-tokens 80
+```
+
+| Benchmark | Result |
+|---|---|
+| Constrained vs. unconstrained throughput | 11.02 vs. 11.06 tok/s -- effectively no overhead; the logits mask is negligible next to a full transformer forward pass |
+| KV-cache memory | 17.52 MB for a prompt + ~80 generated tokens |
+| fp32 vs. int8 weights (size) | 6175 MB -> 2481 MB, a **59.8%** reduction |
+| fp32 vs. int8 throughput | 11.02 -> 13.73 tok/s, a **+24.5%** speedup (qnnpack's real accelerated int8 kernels on ARM, not just smaller weights) |
+
+Combined with the earlier batching result (1.58x at batch 4, 2.37x at batch
+8), the full Phase 3 throughput picture on this CPU-only Mac: batching and
+int8 quantization each independently help, and constrained decoding's
+correctness guarantee is essentially free.
+
+Phase 3 is complete: manual KV-cache management, batching, from-scratch
+constrained decoding, and the benchmark suite. Next: Phase 4, integrating
+into `aws-final`. See PLAN.md.

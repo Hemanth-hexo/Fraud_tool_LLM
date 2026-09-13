@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from cache import CacheManager
+from cache import CacheManager, CacheStats
 
 
 @dataclass
@@ -25,6 +25,7 @@ class GenerationResult:
     text: str
     prefill_seconds: float
     decode_seconds: list[float] = field(default_factory=list)
+    cache_stats: CacheStats | None = None
 
     @property
     def total_seconds(self) -> float:
@@ -102,5 +103,9 @@ class ManualGenerator:
 
         text = self.tokenizer.decode(generated, skip_special_tokens=True)
         return GenerationResult(
-            token_ids=generated, text=text, prefill_seconds=prefill_seconds, decode_seconds=decode_seconds
+            token_ids=generated,
+            text=text,
+            prefill_seconds=prefill_seconds,
+            decode_seconds=decode_seconds,
+            cache_stats=cache_manager.stats(),
         )
