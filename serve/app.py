@@ -8,6 +8,8 @@ Env vars (all optional, sensible defaults for local/Docker use):
     MAX_NEW_TOKENS  -- generation budget per request (default: 100)
     PRECISION       -- "fp16" (default) or "fp32"
     USE_QUANTIZED   -- "1" to additionally int8-quantize on top of PRECISION, "0" (default)
+    TOOL_PLANNER_SHARED_SECRET -- required, no default; callers must send it back as the
+                                  X-Tool-Planner-Token header on POST /plan
 
 Precision notes, both checked directly against the eval set rather than
 assumed:
@@ -27,13 +29,14 @@ assumed:
 """
 import json
 import os
+import secrets
 import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
@@ -52,6 +55,25 @@ MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "100"))
 PRECISION = os.environ.get("PRECISION", "fp16")
 USE_QUANTIZED = os.environ.get("USE_QUANTIZED", "0") == "1"
 TORCH_DTYPE = {"fp16": torch.float16, "fp32": torch.float32}[PRECISION]
+
+# SECURITY (zero-trust internal boundary, matching aws-final's ml-api pattern): a
+# security group is a network-layer control, not an application-layer one -- a
+# compromised container or instance anywhere permitted on that path could still
+# call this endpoint directly and pull a tool plan for arbitrary attacker-chosen
+# features. Fail closed if unset rather than defaulting to "no auth" or a
+# guessable default -- this service must not accept unauthenticated requests.
+TOOL_PLANNER_SHARED_SECRET = os.environ.get("TOOL_PLANNER_SHARED_SECRET")
+if not TOOL_PLANNER_SHARED_SECRET:
+    raise RuntimeError(
+        "FATAL SECURITY ERROR: TOOL_PLANNER_SHARED_SECRET must be set in the environment "
+        "(no default is provided) -- this service must not accept unauthenticated requests."
+    )
+
+
+def require_valid_service_token(x_tool_planner_token: str | None = Header(default=None)):
+    if not x_tool_planner_token or not secrets.compare_digest(x_tool_planner_token, TOOL_PLANNER_SHARED_SECRET):
+        raise HTTPException(status_code=401, detail="Missing or invalid X-Tool-Planner-Token")
+
 
 engine_state: dict = {}
 
@@ -116,7 +138,7 @@ def health():
 
 
 @app.post("/plan", response_model=ToolPlanResponse)
-def plan(features: TransactionFeatures):
+def plan(features: TransactionFeatures, _auth=Depends(require_valid_service_token)):
     tokenizer = engine_state["tokenizer"]
     generator: ManualGenerator = engine_state["generator"]
 

@@ -3,8 +3,9 @@
 A small, locally fine-tuned LLM paired with a **custom-built inference
 engine**, trained to make a structured tool-selection decision in a
 fraud-detection pipeline -- entirely on-device, at $0 marginal cost per
-decision. See [PLAN.md](PLAN.md) for the original project plan and hardware
-constraints.
+decision. Trained, benchmarked, containerized, deployed to AWS, and
+integrated into the target pipeline end to end. See [PLAN.md](PLAN.md)
+for the original project plan and hardware constraints.
 
 ## What this is
 
@@ -16,19 +17,23 @@ hallucinated response. This project builds a self-contained, local
 alternative: synthetic training data generated from the pipeline's own real
 decision logic, a LoRA fine-tune of a 1.5B-parameter model on that data, and
 a custom inference engine -- built from scratch, not `model.generate()` --
-that makes structurally invalid output impossible by construction.
-Everything here runs on a CPU-only laptop; no GPU, no cloud spend.
+that makes structurally invalid output impossible by construction. Trained
+and benchmarked on a CPU-only laptop (no GPU, no cloud spend), then
+containerized and deployed to a real AWS instance, authenticated, and wired
+into the target pipeline in shadow mode for live comparison against
+production traffic.
 
 ## Results at a glance
 
 | | |
 |---|---|
-| Tool-plan accuracy vs. the real production heuristic | **99.3%** exact match |
+| Tool-plan accuracy vs. the real production heuristic | **99.3%-100%** exact match (precision-dependent, see Serving) |
 | JSON validity under constrained decoding | **100%**, even on an untrained model (vs. 50% unconstrained) |
 | Batching throughput | **2.37x** at batch size 8 |
-| int8 quantization | **59.8%** smaller, **+24.5%** faster |
+| int8 quantization | **59.8%** smaller, **+24.5%** faster -- but see the accuracy caveat below |
 | Constrained-decoding overhead | effectively **0%** |
 | Marginal cost per decision | **$0**, fully local inference |
+| Deployment | Live on AWS, authenticated, integrated in shadow mode |
 
 ## How it works
 
@@ -51,6 +56,13 @@ transaction features
         |
         v
   {"selectedTools": [...], "reason": "..."}   -- guaranteed valid, every time
+        |
+        v
+  FastAPI service (authenticated) --> Docker --> AWS EC2 (private VPC)
+        |
+        v
+  target pipeline, shadow mode -- background comparison against live
+  production decisions, never blocking or influencing a real transaction
 ```
 
 ## Repo layout
@@ -61,6 +73,8 @@ transaction features
 | [`data/`](data/) | Synthetic data generator + the ported production heuristic used to label it |
 | [`train/`](train/) | LoRA fine-tuning pipeline and generation-quality eval |
 | [`engine/`](engine/) | The custom inference engine: cache, batching, constrained decoding, benchmarks |
+| [`serve/`](serve/) | The authenticated FastAPI service that puts the engine behind an HTTP endpoint |
+| [`Dockerfile`](Dockerfile) | Containerizes `serve/` for local Docker use or cloud deployment |
 
 ## Quickstart
 
@@ -79,7 +93,11 @@ python3 train/train.py --precision fp32 --device cpu --max-steps 500 \
 python3 engine/verify.py --n 10
 python3 engine/verify_batch.py --batch-size 8
 python3 engine/verify_constrained.py --n 20 --max-new-tokens 80
-python3 engine/benchmark.py --n 10 --max-new-tokens 80
+python3 engine/benchmark.py --n 30 --max-new-tokens 80
+
+# Serve it (see Deployed below for the containerized/AWS version)
+export TOOL_PLANNER_SHARED_SECRET=some-long-random-value
+uvicorn serve.app:app --host 0.0.0.0 --port 8888
 ```
 
 ---
@@ -262,9 +280,19 @@ comfortably fitting on a constrained instance and running one request away
 from an OOM kill; only `USE_QUANTIZED=1` (int8, on top of whichever
 `PRECISION`) needs the same accuracy caution as before.
 
+Every request to `/plan` requires a shared-secret bearer token
+(`X-Tool-Planner-Token`, checked with a constant-time comparison) --
+`TOOL_PLANNER_SHARED_SECRET` is required with no default, so the service
+fails closed at startup rather than ever accepting unauthenticated
+requests. A security group is a network-layer control; a service on the
+same network as a caller is not automatically a trusted one, so the
+application layer checks for itself too.
+
 ```bash
+export TOOL_PLANNER_SHARED_SECRET=some-long-random-value
 uvicorn serve.app:app --host 0.0.0.0 --port 8888
 curl -X POST http://localhost:8888/plan -H "Content-Type: application/json" \
+  -H "X-Tool-Planner-Token: some-long-random-value" \
   -d '{"amount": 15000, "deviceId": "shared_device_42", "ipAddress": "8.8.8.8", "beneficiaryId": "suspect_99", "location": "RU", "time": 3, "userId": "user_1"}'
 ```
 
@@ -276,25 +304,45 @@ CPU-only wheel index explicitly -- the default wheel bundles several GB of
 unused NVIDIA CUDA libraries for a CPU-only container, taking the image
 from ~1.8GB to ~9.5GB for nothing.
 
-Deployed and verified privately reachable from another service's EC2
-instance in the same VPC: an ECR repo holds the built image, a security
-group scopes inbound access on the API port to that other instance's own
-security group specifically (not the open internet), and the instance
-pulls and runs the container via a startup script. Getting this right
-took two real fixes along the way -- the image needs to match the target
-instance's CPU architecture (a Mac build defaults to arm64; an x86_64
-instance needs `docker buildx build --platform linux/amd64`), and fp32
-needs real memory headroom (a memory-constrained instance OOM-killed the
-container under fp32 with a request in flight; fp16 fixed it, see above).
+## Deployed
+
+Live on AWS: an ECR repo holds the built image, a security group scopes
+inbound access on the API port to one specific caller (another service's
+own security group, in the same VPC -- not the open internet), and the
+EC2 instance pulls and runs the container via a startup script. Two real
+fixes came out of actually deploying this rather than just building it:
+the image has to match the target instance's CPU architecture (a Mac
+build defaults to arm64; an x86_64 instance needs
+`docker buildx build --platform linux/amd64`), and fp32 needs real memory
+headroom (a memory-constrained instance OOM-killed the container under
+fp32 with a request in flight -- fp16 fixed it, with the accuracy check
+above to back that up).
+
+Integrated into the target pipeline in **shadow mode**: a background,
+fire-and-forget call alongside the pipeline's existing decision path,
+logging a comparison (tool-selection match, latency) without ever
+blocking or influencing a real transaction. This is deliberate, not a
+placeholder -- CPU-only inference here takes ~25-30s per request, far too
+slow for a live request path, so shadow mode is how a new model gets
+validated against real production traffic before anything depends on it,
+the same way a canary release works. Wiring this into a path that can
+actually gate a transaction would need a differently-scoped model (one
+that outputs a risk verdict, not a tool selection) and is out of scope
+here; the integration code itself lives in the target pipeline's own
+repo, gated behind an environment variable that's a no-op unless
+explicitly configured.
 
 ## Status
 
-Phases 1-3 are complete: this repo is a finished, standalone piece of work
-on its own -- synthetic data generation, a 99.3%-accurate LoRA fine-tune,
-and a custom inference engine with manual KV-cache management, batching,
-from-scratch constrained decoding, and a full benchmark suite.
-
-A further integration step (wiring this model into the target pipeline as
-an additive option alongside its existing decision paths) is documented in
-PLAN.md as a possible next step, but lives in that pipeline's own repo
-rather than here, and depends on that project's own review process.
+Done, end to end: synthetic training data generated from the real
+production decision logic, a 99.3%-to-100%-accurate LoRA fine-tune
+(depending on precision -- see Phase 2 and Serving), a custom inference
+engine built from scratch (manual KV-cache management, batching,
+grammar-constrained decoding, a full benchmark suite), an authenticated
+HTTP service and container around it, and a live AWS deployment
+integrated into the target pipeline in shadow mode. Every claim above is
+backed by a number that was actually measured against held-out data or a
+live deployment, not assumed -- including the two times that discipline
+caught a real regression (int8 quantization's accuracy cost, and fp32's
+memory footprint under real deployment constraints) before either shipped
+unnoticed.
