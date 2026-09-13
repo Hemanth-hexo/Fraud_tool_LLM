@@ -95,8 +95,44 @@ correct), and batching is a real win on this CPU-bound box: **1.58x**
 speedup at batch size 4, **2.37x** at batch size 8, vs. running the same
 prompts one-by-one.
 
-**Still to build:** grammar/schema-constrained decoding from scratch (mask
-logits so the model is structurally incapable of invalid JSON or an unknown
-tool name -- the actual differentiator), and the benchmark suite (latency,
-throughput, memory; constrained vs. unconstrained; quantized vs. fp16). See
-PLAN.md.
+`engine/constrained.py` is the actual differentiator: grammar/schema-
+constrained decoding from scratch, built as a logits mask plugged into the
+same loop (no external constrained-decoding library). The output schema is
+fixed -- `{"selectedTools": [...], "reason": "..."}` -- and most of that is
+deterministic syntax (braces, quotes, key names, commas), so it's
+force-injected directly rather than left to the model's opinion (the same
+"fast-forward" trick real grammar-decoding libraries use for literal grammar
+spans). The model's own masked logits only decide at the two genuinely open
+points: which tool name comes next (a trie over the 5 names, since they all
+share the `query_` prefix and need real token-by-token narrowing, not a
+single-token check), and whether to add another tool or close the array and
+move to `reason`. `reason` itself stays free text -- PLAN.md's ask is valid
+JSON + valid tool names, not hardcoding the heuristic's two known reason
+strings -- guarded only against a stray `"` breaking the JSON, with a
+budget-aware forced-close safety net so output is always complete and valid
+even if the underlying model never learns to stop on its own.
+
+```bash
+python3 engine/verify_constrained.py --n 20 --max-new-tokens 80
+```
+
+**Result**, at a deliberately tight 80-token budget:
+
+| | unconstrained | constrained |
+|---|---|---|
+| Fine-tuned model (knows the task) | 20/20 valid, 20/20 exact match | 20/20 valid, 20/20 exact match |
+| Base model (never saw this schema) | **10/20** valid JSON | **20/20** valid JSON, 20/20 known tool names |
+
+No regression on the model that already knows the task, and on a model that
+doesn't, unconstrained decoding genuinely fails half the time (it rambles in
+the free-text `reason` field and runs out of budget before closing the
+string) while constrained decoding is 100% structurally valid regardless --
+by construction, not by luck. (Its tool *choices* are still wrong on the
+base model, 0/20 exact match, exactly as expected: picking the right tools
+is a training problem, not a decoding one -- constrained decoding only
+guarantees the shape of the answer, not its correctness.)
+
+**Still to build:** the benchmark suite (latency, throughput, memory;
+constrained vs. unconstrained; quantized vs. fp16 -- using CPU int8 dynamic
+quantization as the comparison point in place of QLoRA/bitsandbytes, which
+doesn't run on Apple Silicon). See PLAN.md.
