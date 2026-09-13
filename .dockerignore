@@ -1,0 +1,12 @@
+.venv/
+.git/
+__pycache__/
+*.pyc
+data/*.jsonl
+checkpoints/lora-adapter-v1/
+checkpoints/smoke-test/
+checkpoints/bench-bf16/
+checkpoints/bench-bf16-fixed/
+checkpoints/lora-adapter-v2/checkpoint-*/
+checkpoints/train_run.log
+.DS_Store
