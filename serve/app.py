@@ -85,7 +85,9 @@ async def lifespan(app: FastAPI):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    base = AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype=TORCH_DTYPE)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Device: {device}")
+    base = AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype=TORCH_DTYPE).to(device)
     merged = PeftModel.from_pretrained(base, ADAPTER_PATH).merge_and_unload()
     merged.eval()
 
@@ -103,8 +105,9 @@ async def lifespan(app: FastAPI):
     engine_state["generator"] = ManualGenerator(merged, tokenizer)
     engine_state["vocab_size"] = vocab_size
     engine_state["precision"] = PRECISION
+    engine_state["device"] = device
     engine_state["quant_engine"] = quant_engine or "none"
-    print(f"Ready. Precision: {PRECISION}, quantization: {engine_state['quant_engine']}")
+    print(f"Ready. Device: {device}, precision: {PRECISION}, quantization: {engine_state['quant_engine']}")
     yield
     engine_state.clear()
 
@@ -132,6 +135,7 @@ class ToolPlanResponse(BaseModel):
 def health():
     return {
         "status": "ok" if engine_state else "loading",
+        "device": engine_state.get("device", "not loaded"),
         "precision": engine_state.get("precision", "not loaded"),
         "quantization": engine_state.get("quant_engine", "not loaded"),
     }
