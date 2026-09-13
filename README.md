@@ -253,15 +253,39 @@ decoding's correctness guarantee is essentially free either way.
 `serve/app.py` wraps the engine in a small FastAPI service (`POST /plan`,
 `GET /health`) so it can run as a standalone container instead of only via
 local scripts -- the same artifact works for running in Docker locally or
-deploying to a cloud instance. It defaults to fp32 for the reason directly
-above; set `USE_QUANTIZED=1` only if you've separately verified acceptable
-accuracy for your use case.
+deploying to a cloud instance. It defaults to **fp16**, checked directly
+against the eval set rather than assumed: 100% exact-match accuracy either
+way against fp32 (30/30), at half the weight memory (3.1GB vs. 6.2GB) --
+unlike int8 above, fp16's gentler precision cut doesn't damage LoRA's small
+merged weight adjustments. That memory difference is the difference between
+comfortably fitting on a constrained instance and running one request away
+from an OOM kill; only `USE_QUANTIZED=1` (int8, on top of whichever
+`PRECISION`) needs the same accuracy caution as before.
 
 ```bash
 uvicorn serve.app:app --host 0.0.0.0 --port 8888
 curl -X POST http://localhost:8888/plan -H "Content-Type: application/json" \
   -d '{"amount": 15000, "deviceId": "shared_device_42", "ipAddress": "8.8.8.8", "beneficiaryId": "suspect_99", "location": "RU", "time": 3, "userId": "user_1"}'
 ```
+
+`Dockerfile` builds this into a container: only the LoRA adapter's final
+weights ship in the image (~90MB; training checkpoints are excluded via
+`.dockerignore`), and the base model downloads from Hugging Face Hub at
+container startup rather than being baked in. torch installs from PyPI's
+CPU-only wheel index explicitly -- the default wheel bundles several GB of
+unused NVIDIA CUDA libraries for a CPU-only container, taking the image
+from ~1.8GB to ~9.5GB for nothing.
+
+Deployed and verified privately reachable from another service's EC2
+instance in the same VPC: an ECR repo holds the built image, a security
+group scopes inbound access on the API port to that other instance's own
+security group specifically (not the open internet), and the instance
+pulls and runs the container via a startup script. Getting this right
+took two real fixes along the way -- the image needs to match the target
+instance's CPU architecture (a Mac build defaults to arm64; an x86_64
+instance needs `docker buildx build --platform linux/amd64`), and fp32
+needs real memory headroom (a memory-constrained instance OOM-killed the
+container under fp32 with a request in flight; fp16 fixed it, see above).
 
 ## Status
 

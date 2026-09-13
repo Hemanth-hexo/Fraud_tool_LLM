@@ -6,17 +6,24 @@ Env vars (all optional, sensible defaults for local/Docker use):
     BASE_MODEL      -- HF model id (default: Qwen/Qwen2.5-1.5B-Instruct)
     ADAPTER_PATH    -- path to the LoRA adapter (default: checkpoints/lora-adapter-v2)
     MAX_NEW_TOKENS  -- generation budget per request (default: 100)
-    USE_QUANTIZED   -- "1" to serve the int8-quantized model, "0" (default) for fp32
+    PRECISION       -- "fp16" (default) or "fp32"
+    USE_QUANTIZED   -- "1" to additionally int8-quantize on top of PRECISION, "0" (default)
 
-Quantization is opt-in, not the default: int8 dynamic quantization measurably
-shrinks and speeds up this model (engine/benchmark.py), but a direct accuracy
-check found it drops exact-match tool-plan accuracy from 99.3% to ~47% --
-LoRA fine-tuning applies small, delicate weight adjustments that aggressive
-int8 quantization of the merged weights washes out. JSON stays 100% valid
-either way (that's still a structural guarantee, not a statistical one), but
-*correct* tool selection is the actual point of this model, so fp32 is the
-safe default. Only set USE_QUANTIZED=1 if you've separately verified
-acceptable accuracy for your use case.
+Precision notes, both checked directly against the eval set rather than
+assumed:
+  - fp16 vs. fp32: 100% exact-match accuracy either way (30/30), fp16 at
+    half the weight memory (3.1GB vs. 6.2GB). No real tradeoff here, so
+    fp16 is the default -- it's what makes this comfortably fit on a
+    memory-constrained instance instead of running a hair away from OOM.
+  - int8 dynamic quantization is a different story: it drops exact-match
+    accuracy from 100% to ~47%. LoRA fine-tuning applies small, delicate
+    weight adjustments that aggressive int8 quantization of the merged
+    weights washes out -- fp16's gentler precision cut doesn't have this
+    problem. JSON stays 100% valid regardless of precision (that's a
+    structural guarantee from the constrained decoder, not a statistical
+    one), but *correct* tool selection is the actual point of this model,
+    so int8 stays opt-in. Only set USE_QUANTIZED=1 if you've separately
+    verified acceptable accuracy for your use case.
 """
 import json
 import os
@@ -42,7 +49,9 @@ from quantize import quantize_for_serving  # noqa: E402
 BASE_MODEL = os.environ.get("BASE_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
 ADAPTER_PATH = os.environ.get("ADAPTER_PATH", str(REPO_ROOT / "checkpoints" / "lora-adapter-v2"))
 MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "100"))
+PRECISION = os.environ.get("PRECISION", "fp16")
 USE_QUANTIZED = os.environ.get("USE_QUANTIZED", "0") == "1"
+TORCH_DTYPE = {"fp16": torch.float16, "fp32": torch.float32}[PRECISION]
 
 engine_state: dict = {}
 
@@ -54,7 +63,7 @@ async def lifespan(app: FastAPI):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    base = AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype=torch.float32)
+    base = AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype=TORCH_DTYPE)
     merged = PeftModel.from_pretrained(base, ADAPTER_PATH).merge_and_unload()
     merged.eval()
 
@@ -71,8 +80,9 @@ async def lifespan(app: FastAPI):
     engine_state["model"] = merged
     engine_state["generator"] = ManualGenerator(merged, tokenizer)
     engine_state["vocab_size"] = vocab_size
-    engine_state["quant_engine"] = quant_engine or "none (fp32)"
-    print(f"Ready. Quantization: {engine_state['quant_engine']}")
+    engine_state["precision"] = PRECISION
+    engine_state["quant_engine"] = quant_engine or "none"
+    print(f"Ready. Precision: {PRECISION}, quantization: {engine_state['quant_engine']}")
     yield
     engine_state.clear()
 
@@ -98,7 +108,11 @@ class ToolPlanResponse(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "quantization": engine_state.get("quant_engine", "not loaded")}
+    return {
+        "status": "ok" if engine_state else "loading",
+        "precision": engine_state.get("precision", "not loaded"),
+        "quantization": engine_state.get("quant_engine", "not loaded"),
+    }
 
 
 @app.post("/plan", response_model=ToolPlanResponse)
