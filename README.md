@@ -1,21 +1,23 @@
 # Fraud Tool-Planner LLM
 
-A small, locally fine-tuned LLM with a **custom-built inference engine**,
-trained as a $0-marginal-cost, GPT-5-free replacement for the "Tool Planner"
-phase of a production fraud-detection agentic AI service. See
-[PLAN.md](PLAN.md) for the original project plan and hardware constraints.
+A small, locally fine-tuned LLM paired with a **custom-built inference
+engine**, trained to make a structured tool-selection decision in a
+fraud-detection pipeline -- entirely on-device, at $0 marginal cost per
+decision. See [PLAN.md](PLAN.md) for the original project plan and hardware
+constraints.
 
 ## What this is
 
-A production fraud-detection service currently calls GPT-5 to decide which
-of 5 read-only investigation tools to run per transaction, at API cost, with
-no guarantee the model won't hallucinate an unknown tool name. This project
-replaces that call end-to-end: synthetic training data generated from the
-service's own real decision logic, a LoRA fine-tune of a 1.5B-parameter
-model on that data, and a custom inference engine -- built from scratch,
-not `model.generate()` -- that makes structurally invalid output impossible
-by construction. Everything here runs on a CPU-only laptop; no GPU, no
-cloud spend.
+A fraud-detection pipeline needs to decide which of 5 read-only
+investigation tools to run per transaction. That decision is currently made
+by an external hosted LLM API call -- effective, but with recurring
+per-token cost and no structural guarantee against a malformed or
+hallucinated response. This project builds a self-contained, local
+alternative: synthetic training data generated from the pipeline's own real
+decision logic, a LoRA fine-tune of a 1.5B-parameter model on that data, and
+a custom inference engine -- built from scratch, not `model.generate()` --
+that makes structurally invalid output impossible by construction.
+Everything here runs on a CPU-only laptop; no GPU, no cloud spend.
 
 ## Results at a glance
 
@@ -26,7 +28,7 @@ cloud spend.
 | Batching throughput | **2.37x** at batch size 8 |
 | int8 quantization | **59.8%** smaller, **+24.5%** faster |
 | Constrained-decoding overhead | effectively **0%** |
-| Marginal cost per decision | **$0** (vs. per-token GPT-5 API cost) |
+| Marginal cost per decision | **$0**, fully local inference |
 
 ## How it works
 
@@ -237,8 +239,7 @@ on its own -- synthetic data generation, a 99.3%-accurate LoRA fine-tune,
 and a custom inference engine with manual KV-cache management, batching,
 from-scratch constrained decoding, and a full benchmark suite.
 
-A further integration step (wiring this model into the production service
-as an additive third option alongside its existing GPT-5/heuristic paths)
-is documented in PLAN.md as a possible next step, but lives in that other
-service's own repo rather than here, and depends on that project's own
-review process.
+A further integration step (wiring this model into the target pipeline as
+an additive option alongside its existing decision paths) is documented in
+PLAN.md as a possible next step, but lives in that pipeline's own repo
+rather than here, and depends on that project's own review process.
