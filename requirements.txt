@@ -1,4 +1,5 @@
 accelerate==1.15.0
+fastapi==0.141.1
 huggingface_hub==1.31.0
 numpy==2.5.3
 peft==0.20.0
@@ -7,3 +8,4 @@ safetensors==0.8.0
 sentencepiece==0.2.2
 torch==2.14.0
 transformers==5.17.0
+uvicorn[standard]==0.52.4

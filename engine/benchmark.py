@@ -14,7 +14,7 @@ underlying question (does quantizing the linear layers help or hurt on the
 hardware we actually have).
 
 Usage:
-    python3 engine/benchmark.py --n 10
+    python3 engine/benchmark.py --n 30
 """
 import argparse
 import io
@@ -42,6 +42,32 @@ def state_dict_bytes(model) -> int:
     buf = io.BytesIO()
     torch.save(model.state_dict(), buf)
     return buf.getbuffer().nbytes
+
+
+KNOWN_TOOLS = {
+    "query_fraud_history",
+    "query_beneficiary_trust",
+    "query_behavioral_norms",
+    "query_graph_risk",
+    "query_fraud_policies",
+}
+
+
+def check_accuracy(generator, tokenizer, rows, prompts, vocab_size, max_new_tokens):
+    """Runs constrained decoding and checks exact-match tool-plan accuracy
+    against the heuristic ground truth. Speed and size aren't the only things
+    that can regress under a technique like quantization -- accuracy has to
+    be checked directly, not assumed, however good the throughput numbers
+    look; see the fp32-vs-int8 accuracy delta below for exactly why."""
+    n_exact = 0
+    for row, prompt_text in zip(rows, prompts):
+        prompt_len = len(tokenizer(prompt_text, add_special_tokens=False)["input_ids"])
+        decoder = ConstrainedToolPlanDecoder(tokenizer, prompt_len, vocab_size, max_new_tokens=max_new_tokens)
+        result = generator.generate(prompt_text, max_new_tokens=max_new_tokens, logits_processor=decoder)
+        parsed = json.loads(result.text)  # constrained decoding guarantees this parses
+        if set(parsed.get("selectedTools", [])) == set(row["output"]["selectedTools"]):
+            n_exact += 1
+    return n_exact / len(rows)
 
 
 def run_latency(generator, prompts, max_new_tokens, logits_processor_factory=None):
@@ -121,6 +147,17 @@ def main():
     print(f"size reduction: {100 * (1 - int8_bytes / fp32_bytes):.1f}%")
     speed_delta = 100 * (int8_results["avg_tokens_per_sec"] / unconstrained["avg_tokens_per_sec"] - 1)
     print(f"speed change: {speed_delta:+.1f}%")
+
+    print("\n=== 3. Accuracy: fp32 vs. int8 (the check speed/size numbers alone would miss) ===")
+    fp32_accuracy = check_accuracy(generator, tokenizer, rows, prompts, vocab_size, args.max_new_tokens)
+    int8_accuracy = check_accuracy(int8_generator, tokenizer, rows, prompts, vocab_size, args.max_new_tokens)
+    print(f"fp32 exact-match accuracy: {100 * fp32_accuracy:.1f}%")
+    print(f"int8 exact-match accuracy: {100 * int8_accuracy:.1f}%")
+    if int8_accuracy < fp32_accuracy - 0.05:
+        print("int8 quantization measurably hurts task accuracy here -- LoRA fine-tuning applies small, "
+              "delicate weight adjustments that aggressive int8 quantization of the merged weights can "
+              "wash out. Faster/smaller is not automatically a win; don't ship quantization on the "
+              "strength of the speed/size numbers alone.")
 
 
 if __name__ == "__main__":

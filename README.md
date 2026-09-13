@@ -217,20 +217,51 @@ and doesn't run on Apple Silicon -- CPU int8 dynamic quantization
 quantized-kernel backend this Mac actually has) is the same-machine stand-in.
 
 ```bash
-python3 engine/benchmark.py --n 10 --max-new-tokens 80
+python3 engine/benchmark.py --n 30 --max-new-tokens 80
 ```
 
 | Benchmark | Result |
 |---|---|
-| Constrained vs. unconstrained throughput | 11.02 vs. 11.06 tok/s -- effectively no overhead; the logits mask is negligible next to a full transformer forward pass |
-| KV-cache memory | 17.52 MB for a prompt + ~80 generated tokens |
+| Constrained vs. unconstrained throughput | 10.33 vs. 10.57 tok/s -- effectively no overhead; the logits mask is negligible next to a full transformer forward pass |
+| KV-cache memory | 17.97 MB for a prompt + ~80 generated tokens |
 | fp32 vs. int8 weights (size) | 6175 MB -> 2481 MB, a **59.8%** reduction |
-| fp32 vs. int8 throughput | 11.02 -> 13.73 tok/s, a **+24.5%** speedup (qnnpack's real accelerated int8 kernels on ARM, not just smaller weights) |
+| fp32 vs. int8 throughput | 10.33 -> 14.12 tok/s, a **+36.6%** speedup (qnnpack's real accelerated int8 kernels on ARM, not just smaller weights) |
+| **fp32 vs. int8 exact-match accuracy** | **100% -> 46.7%** |
+
+That last row is the one that matters most, and it very nearly shipped
+unnoticed: the first pass at this benchmark only measured speed and size,
+which made int8 look like a clean win. A direct accuracy check tells a
+different story -- LoRA fine-tuning applies small, delicate weight
+adjustments, and aggressive int8 quantization of the merged weights washes
+enough of that out to roughly halve tool-plan accuracy, even though JSON
+validity stays at 100% either way (that's a structural guarantee from the
+constrained decoder, not a statistical one -- it says nothing about whether
+the *content* is right). The lesson generalizes past this one project: a
+compression technique's speed and size numbers say nothing about whether the
+output is still correct, and only checking the former is exactly how this
+kind of regression gets shipped. The serving layer defaults to fp32 as a
+result; quantization is opt-in, not on by default.
 
 Combined with the batching result above (1.58x at batch 4, 2.37x at batch 8),
-the full picture on this CPU-only machine: batching and int8 quantization
-each independently help, and constrained decoding's correctness guarantee is
-essentially free.
+the full picture on this CPU-only machine: batching is a clean win, int8
+quantization is a real speed/size win *with a real accuracy cost* that has
+to be weighed deliberately rather than assumed away, and constrained
+decoding's correctness guarantee is essentially free either way.
+
+## Serving
+
+`serve/app.py` wraps the engine in a small FastAPI service (`POST /plan`,
+`GET /health`) so it can run as a standalone container instead of only via
+local scripts -- the same artifact works for running in Docker locally or
+deploying to a cloud instance. It defaults to fp32 for the reason directly
+above; set `USE_QUANTIZED=1` only if you've separately verified acceptable
+accuracy for your use case.
+
+```bash
+uvicorn serve.app:app --host 0.0.0.0 --port 8888
+curl -X POST http://localhost:8888/plan -H "Content-Type: application/json" \
+  -d '{"amount": 15000, "deviceId": "shared_device_42", "ipAddress": "8.8.8.8", "beneficiaryId": "suspect_99", "location": "RU", "time": 3, "userId": "user_1"}'
+```
 
 ## Status
 
