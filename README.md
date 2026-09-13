@@ -74,8 +74,29 @@ tokens/sec on CPU with only ~5% wall-clock overhead vs. the built-in path
 (52.2s vs. 49.8s total) -- the manual loop isn't just correct, it's not
 leaving obvious performance on the table either.
 
-**Still to build:** batching (serve multiple transactions concurrently),
-grammar/schema-constrained decoding from scratch (mask logits so the model
-is structurally incapable of invalid JSON or an unknown tool name -- the
-actual differentiator), and the benchmark suite (latency, throughput, memory;
-constrained vs. unconstrained; quantized vs. fp16). See PLAN.md.
+`engine/batch_generate.py` extends the same loop to serve several
+transactions in one forward pass. The real work isn't the loop, it's that
+`DynamicCache` holds one tensor per layer shared across the whole batch --
+every row must share a sequence length at every step. We handle that
+ourselves: left-padding (so short prompts don't shift where new tokens get
+appended), per-row position ids (computed once from the attention mask,
+since RoPE needs each row's true position, not its padded index), and
+per-row early stopping (a finished row can't shrink out of the shared cache
+tensor, so it keeps getting silently decoded and we just stop recording its
+tokens once EOS appears).
+
+```bash
+python3 engine/verify_batch.py --batch-size 8
+```
+
+**Result:** batched output is token-for-token identical to generating each
+prompt alone (proves the padding/position-id/early-stop handling is
+correct), and batching is a real win on this CPU-bound box: **1.58x**
+speedup at batch size 4, **2.37x** at batch size 8, vs. running the same
+prompts one-by-one.
+
+**Still to build:** grammar/schema-constrained decoding from scratch (mask
+logits so the model is structurally incapable of invalid JSON or an unknown
+tool name -- the actual differentiator), and the benchmark suite (latency,
+throughput, memory; constrained vs. unconstrained; quantized vs. fp16). See
+PLAN.md.
