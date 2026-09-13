@@ -48,7 +48,34 @@ run -- oversampling that case 3x and resuming from the v1 adapter via
 exact match, with the one remaining miss a reasonable near-confusion on an
 IP (`192.122.90.30`) that superficially resembles the trigger IP.
 
-## Next: Phase 3
+## Phase 3 — custom inference engine (in progress)
 
-Build the custom inference engine (manual KV-cache, batching, from-scratch
-grammar-constrained decoding) and benchmark it. See PLAN.md.
+`engine/cache.py` + `engine/generate.py`: a manual autoregressive decode loop
+-- no `model.generate()`. We create the `DynamicCache` ourselves, run one
+prefill forward pass over the prompt, then repeatedly feed just the last
+generated token (plus the same growing cache) back in, one step at a time.
+Transformers' own cache tensor mechanics are reused (its masking/sliding-
+window internals are deep, fast-moving library code not worth reimplementing)
+-- what we own is the loop itself: prefill vs. decode are explicit, the cache
+lifecycle is fully visible and inspectable (`CacheManager.stats()`), and each
+decode step is individually timed. This is also the hook point for what's
+next: constrained decoding masks `logits` right before the argmax in
+`generate.py`, and batching reuses the same loop with a batch dimension.
+
+`engine/verify.py` checks correctness the only way that matters: token-for-
+token identical output against `model.generate()` on real eval examples.
+
+```bash
+python3 engine/verify.py --n 10
+```
+
+**Result:** 10/10 outputs byte-identical to `model.generate()`, at ~8.7
+tokens/sec on CPU with only ~5% wall-clock overhead vs. the built-in path
+(52.2s vs. 49.8s total) -- the manual loop isn't just correct, it's not
+leaving obvious performance on the table either.
+
+**Still to build:** batching (serve multiple transactions concurrently),
+grammar/schema-constrained decoding from scratch (mask logits so the model
+is structurally incapable of invalid JSON or an unknown tool name -- the
+actual differentiator), and the benchmark suite (latency, throughput, memory;
+constrained vs. unconstrained; quantized vs. fp16). See PLAN.md.
