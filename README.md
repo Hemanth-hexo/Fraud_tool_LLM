@@ -1,14 +1,94 @@
-# fraud-tool-planner-llm
+# Fraud Tool-Planner LLM
 
-See [PLAN.md](PLAN.md) for the full project plan.
+A small, locally fine-tuned LLM with a **custom-built inference engine**,
+trained as a $0-marginal-cost, GPT-5-free replacement for the "Tool Planner"
+phase of a production fraud-detection agentic AI service. See
+[PLAN.md](PLAN.md) for the original project plan and hardware constraints.
 
-## Phase 1 — synthetic training data (done)
+## What this is
+
+A production fraud-detection service currently calls GPT-5 to decide which
+of 5 read-only investigation tools to run per transaction, at API cost, with
+no guarantee the model won't hallucinate an unknown tool name. This project
+replaces that call end-to-end: synthetic training data generated from the
+service's own real decision logic, a LoRA fine-tune of a 1.5B-parameter
+model on that data, and a custom inference engine -- built from scratch,
+not `model.generate()` -- that makes structurally invalid output impossible
+by construction. Everything here runs on a CPU-only laptop; no GPU, no
+cloud spend.
+
+## Results at a glance
+
+| | |
+|---|---|
+| Tool-plan accuracy vs. the real production heuristic | **99.3%** exact match |
+| JSON validity under constrained decoding | **100%**, even on an untrained model (vs. 50% unconstrained) |
+| Batching throughput | **2.37x** at batch size 8 |
+| int8 quantization | **59.8%** smaller, **+24.5%** faster |
+| Constrained-decoding overhead | effectively **0%** |
+| Marginal cost per decision | **$0** (vs. per-token GPT-5 API cost) |
+
+## How it works
+
+```
+transaction features
+        |
+        v
+  synthetic data generator  --labeled by the real production heuristic-->  train/eval JSONL
+        |
+        v
+  LoRA fine-tune (Qwen2.5-1.5B-Instruct)  -->  adapter, 99.3% accurate
+        |
+        v
+  custom inference engine
+    - manual KV-cache management (own the generation loop, no model.generate())
+    - batching (serve several transactions in one forward pass)
+    - grammar-constrained decoding (logits masked so invalid JSON / unknown
+      tool names are structurally impossible)
+    - int8 quantization (smaller + faster on CPU)
+        |
+        v
+  {"selectedTools": [...], "reason": "..."}   -- guaranteed valid, every time
+```
+
+## Repo layout
+
+| Path | What's in it |
+|---|---|
+| [`PLAN.md`](PLAN.md) | Original project plan, constraints, and hardware notes |
+| [`data/`](data/) | Synthetic data generator + the ported production heuristic used to label it |
+| [`train/`](train/) | LoRA fine-tuning pipeline and generation-quality eval |
+| [`engine/`](engine/) | The custom inference engine: cache, batching, constrained decoding, benchmarks |
+
+## Quickstart
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# Phase 1: generate training data
+python3 data/generate_dataset.py --n-train 4000 --n-eval 500
+
+# Phase 2: fine-tune
+python3 train/train.py --precision fp32 --device cpu --max-steps 500 \
+  --batch-size 2 --max-eval-samples 30 --out-dir checkpoints/lora-adapter-v1
+
+# Phase 3: exercise the inference engine
+python3 engine/verify.py --n 10
+python3 engine/verify_batch.py --batch-size 8
+python3 engine/verify_constrained.py --n 20 --max-new-tokens 80
+python3 engine/benchmark.py --n 10 --max-new-tokens 80
+```
+
+---
+
+## Phase 1 — synthetic training data
 
 `data/heuristic.py` is a line-for-line Python port of the heuristic fallback
-branch in `aws-final`'s `agentic_ai.service.js` (verified byte-for-byte against
-the JS on 2000 random inputs). `data/generate_dataset.py` generates random,
-realistic transaction feature vectors and labels each one with that heuristic,
-producing `data/train.jsonl` and `data/eval.jsonl`.
+branch in the production service's tool-planner code (verified byte-for-byte
+against the original JS on 2000 random inputs). `data/generate_dataset.py`
+generates random, realistic transaction feature vectors and labels each one
+with that heuristic, producing `data/train.jsonl` and `data/eval.jsonl`.
 
 ```bash
 python3 data/generate_dataset.py --n-train 4000 --n-eval 500
@@ -16,15 +96,13 @@ python3 data/generate_dataset.py --n-train 4000 --n-eval 500
 
 Each line is `{"features": {...}, "output": {"selectedTools": [...], "reason": "..."}}`.
 
-## Phase 2 — LoRA fine-tune (done)
+## Phase 2 — LoRA fine-tune
 
 `train/train.py` LoRA fine-tunes Qwen2.5-1.5B-Instruct on the Phase 1 dataset
 via `peft`. One script for both target machines -- `--precision` picks
 fp16/bf16 (Mac) or 4-bit QLoRA (Omen, gated to require CUDA).
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements-train.txt
 python3 train/train.py --precision fp32 --device cpu --max-steps 500 \
   --batch-size 2 --max-eval-samples 30 --out-dir checkpoints/lora-adapter-v1
 ```
@@ -33,7 +111,7 @@ python3 train/train.py --precision fp32 --device cpu --max-steps 500 \
 backend benchmarked ~2x *slower* than plain CPU for raw forward/backward
 passes on this model -- likely immature Metal kernels for the brand-new M5
 GPU. `train.py` defaults training to `--device cpu` as a result; re-benchmark
-MPS as PyTorch releases catch up, or use `--device cuda` on the Omen.
+MPS as PyTorch releases catch up, or use `--device cuda` on a CUDA machine.
 
 `train/eval_model.py` checks real generation (not just teacher-forced loss)
 against held-out data: JSON validity, known tool names, and exact
@@ -48,7 +126,7 @@ run -- oversampling that case 3x and resuming from the v1 adapter via
 exact match, with the one remaining miss a reasonable near-confusion on an
 IP (`192.122.90.30`) that superficially resembles the trigger IP.
 
-## Phase 3 — custom inference engine (done)
+## Phase 3 — custom inference engine
 
 `engine/cache.py` + `engine/generate.py`: a manual autoregressive decode loop
 -- no `model.generate()`. We create the `DynamicCache` ourselves, run one
@@ -58,12 +136,7 @@ Transformers' own cache tensor mechanics are reused (its masking/sliding-
 window internals are deep, fast-moving library code not worth reimplementing)
 -- what we own is the loop itself: prefill vs. decode are explicit, the cache
 lifecycle is fully visible and inspectable (`CacheManager.stats()`), and each
-decode step is individually timed. This is also the hook point for what's
-next: constrained decoding masks `logits` right before the argmax in
-`generate.py`, and batching reuses the same loop with a batch dimension.
-
-`engine/verify.py` checks correctness the only way that matters: token-for-
-token identical output against `model.generate()` on real eval examples.
+decode step is individually timed.
 
 ```bash
 python3 engine/verify.py --n 10
@@ -106,11 +179,11 @@ spans). The model's own masked logits only decide at the two genuinely open
 points: which tool name comes next (a trie over the 5 names, since they all
 share the `query_` prefix and need real token-by-token narrowing, not a
 single-token check), and whether to add another tool or close the array and
-move to `reason`. `reason` itself stays free text -- PLAN.md's ask is valid
-JSON + valid tool names, not hardcoding the heuristic's two known reason
-strings -- guarded only against a stray `"` breaking the JSON, with a
-budget-aware forced-close safety net so output is always complete and valid
-even if the underlying model never learns to stop on its own.
+move to `reason`. `reason` itself stays free text -- the goal is valid JSON
++ valid tool names, not hardcoding the heuristic's two known reason strings
+-- guarded only against a stray `"` breaking the JSON, with a budget-aware
+forced-close safety net so output is always complete and valid even if the
+underlying model never learns to stop on its own.
 
 ```bash
 python3 engine/verify_constrained.py --n 20 --max-new-tokens 80
@@ -136,11 +209,10 @@ guarantees the shape of the answer, not its correctness.)
 
 `engine/benchmark.py` covers what `verify_batch.py` didn't already measure:
 constrained-decoding overhead, KV-cache memory footprint, and a quantization
-comparison. On quantization: PLAN.md's "quantized vs. fp16" means QLoRA /
-`bitsandbytes` 4-bit, which is CUDA-only and doesn't run on Apple Silicon --
-CPU int8 dynamic quantization (`torch.quantization.quantize_dynamic`, on the
-`qnnpack` backend, the only quantized-kernel backend this Mac actually has)
-is the same-machine stand-in.
+comparison. On quantization: true QLoRA / `bitsandbytes` 4-bit is CUDA-only
+and doesn't run on Apple Silicon -- CPU int8 dynamic quantization
+(`torch.quantization.quantize_dynamic`, on the `qnnpack` backend, the only
+quantized-kernel backend this Mac actually has) is the same-machine stand-in.
 
 ```bash
 python3 engine/benchmark.py --n 10 --max-new-tokens 80
@@ -153,11 +225,20 @@ python3 engine/benchmark.py --n 10 --max-new-tokens 80
 | fp32 vs. int8 weights (size) | 6175 MB -> 2481 MB, a **59.8%** reduction |
 | fp32 vs. int8 throughput | 11.02 -> 13.73 tok/s, a **+24.5%** speedup (qnnpack's real accelerated int8 kernels on ARM, not just smaller weights) |
 
-Combined with the earlier batching result (1.58x at batch 4, 2.37x at batch
-8), the full Phase 3 throughput picture on this CPU-only Mac: batching and
-int8 quantization each independently help, and constrained decoding's
-correctness guarantee is essentially free.
+Combined with the batching result above (1.58x at batch 4, 2.37x at batch 8),
+the full picture on this CPU-only machine: batching and int8 quantization
+each independently help, and constrained decoding's correctness guarantee is
+essentially free.
 
-Phase 3 is complete: manual KV-cache management, batching, from-scratch
-constrained decoding, and the benchmark suite. Next: Phase 4, integrating
-into `aws-final`. See PLAN.md.
+## Status
+
+Phases 1-3 are complete: this repo is a finished, standalone piece of work
+on its own -- synthetic data generation, a 99.3%-accurate LoRA fine-tune,
+and a custom inference engine with manual KV-cache management, batching,
+from-scratch constrained decoding, and a full benchmark suite.
+
+A further integration step (wiring this model into the production service
+as an additive third option alongside its existing GPT-5/heuristic paths)
+is documented in PLAN.md as a possible next step, but lives in that other
+service's own repo rather than here, and depends on that project's own
+review process.
