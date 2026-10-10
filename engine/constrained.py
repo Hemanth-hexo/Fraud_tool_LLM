@@ -122,10 +122,19 @@ class ConstrainedToolPlanDecoder:
             # If the array stayed open, we'd still need room for `close_ids` + at
             # least one reason token + `suffix_ids` before the budget runs out.
             min_close_path = len(self.close_ids) + 1 + len(self.suffix_ids)
+            # Choosing "continue" commits to another separator + a whole tool name + the close
+            # path; only allow it if all of that still fits. (Checking just the close path let
+            # a tight budget run out mid-tool or mid-close, emitting truncated, invalid JSON.)
+            longest_tool = max(len(ids) for ids in self.tool_ids.values())
+            continue_path = len(self.continue_ids) + longest_tool + min_close_path
             remaining = self._remaining(generated)
-            must_close = remaining is not None and remaining <= min_close_path
+            must_close = remaining is not None and remaining <= continue_path
             options = [self.close_ids]
-            if len(ctx["used"]) < self.max_tools and not must_close:
+            # The budget decision is made ONCE, at the start of the span (pos 0). Re-checking it
+            # on every token un-allowed "continue" halfway through emitting it, leaving no legal
+            # token at all (the mask went all -inf and argmax emitted garbage). Committing at
+            # pos 0 is safe: continue_path already reserves room for the rest.
+            if len(ctx["used"]) < self.max_tools and (ctx["pos"] > 0 or not must_close):
                 options.append(self.continue_ids)
             options = [o for o in options if o[: ctx["pos"]] == ctx["consumed"]]
             return self._choice([o[ctx["pos"]] for o in options])

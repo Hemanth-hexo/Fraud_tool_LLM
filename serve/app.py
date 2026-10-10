@@ -8,6 +8,11 @@ Env vars (all optional, sensible defaults for local/Docker use):
     MAX_NEW_TOKENS  -- generation budget per request (default: 100)
     PRECISION       -- "fp16" (default) or "fp32"
     USE_QUANTIZED   -- "1" to additionally int8-quantize on top of PRECISION, "0" (default)
+    FAST_DECODING   -- "1" (default): engine/fast_planner.py -- grammar-forced tokens fed in one
+                       forward pass, cached system-prompt prefix, ~4-8x faster on CPU with
+                       identical plans (engine/verify_fast.py). "0": the original token-by-token
+                       path with a model-written `reason`.
+    TORCH_THREADS   -- optional intra-op thread count for CPU inference
     TOOL_PLANNER_SHARED_SECRET -- required, no default; callers must send it back as the
                                   X-Tool-Planner-Token header on POST /plan
 
@@ -31,6 +36,7 @@ import json
 import os
 import secrets
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -48,12 +54,22 @@ from prompt import build_messages  # noqa: E402
 from generate import ManualGenerator  # noqa: E402
 from constrained import ConstrainedToolPlanDecoder  # noqa: E402
 from quantize import quantize_for_serving  # noqa: E402
+from fast_planner import FastToolPlanner, static_prefix_for  # noqa: E402
 
 BASE_MODEL = os.environ.get("BASE_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
 ADAPTER_PATH = os.environ.get("ADAPTER_PATH", str(REPO_ROOT / "checkpoints" / "lora-adapter-v2"))
 MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "100"))
 PRECISION = os.environ.get("PRECISION", "fp16")
 USE_QUANTIZED = os.environ.get("USE_QUANTIZED", "0") == "1"
+FAST_DECODING = os.environ.get("FAST_DECODING", "1") == "1"
+# One inference at a time: on CPU, concurrent forward passes just split the same cores and make
+# every request slower (and the engine's per-request KV caches are large). A request that can't
+# start within QUEUE_WAIT_S gets 503 immediately, so the caller falls back to its deterministic
+# plan instead of queueing behind work it will have stopped waiting for.
+INFERENCE_LOCK = threading.Lock()
+QUEUE_WAIT_S = float(os.environ.get("QUEUE_WAIT_S", "1.0"))
+if os.environ.get("TORCH_THREADS"):
+    torch.set_num_threads(int(os.environ["TORCH_THREADS"]))
 TORCH_DTYPE = {"fp16": torch.float16, "fp32": torch.float32}[PRECISION]
 
 # SECURITY (zero-trust internal boundary, matching aws-final's ml-api pattern): a
@@ -103,10 +119,18 @@ async def lifespan(app: FastAPI):
     engine_state["tokenizer"] = tokenizer
     engine_state["model"] = merged
     engine_state["generator"] = ManualGenerator(merged, tokenizer)
+    if FAST_DECODING:
+        engine_state["fast"] = FastToolPlanner(merged, tokenizer, static_prompt_prefix=static_prefix_for(tokenizer, build_messages))
+        # Warm-up: the first forward passes pay one-off allocation/kernel-selection costs; pay
+        # them at startup, not on the first real transaction.
+        warm = tokenizer.apply_chat_template(build_messages({"amount": 100.0}), tokenize=False, add_generation_prompt=True)
+        for _ in range(2):
+            engine_state["fast"].plan(warm)
     engine_state["vocab_size"] = vocab_size
     engine_state["precision"] = PRECISION
     engine_state["device"] = device
     engine_state["quant_engine"] = quant_engine or "none"
+    engine_state["engine"] = "fast-constrained" if FAST_DECODING else "token-by-token-constrained"
     print(f"Ready. Device: {device}, precision: {PRECISION}, quantization: {engine_state['quant_engine']}")
     yield
     engine_state.clear()
@@ -129,6 +153,8 @@ class ToolPlanResponse(BaseModel):
     selectedTools: list[str]
     reason: str
     latency_ms: float
+    engine: str | None = None
+    forward_passes: int | None = None
 
 
 @app.get("/health")
@@ -138,6 +164,7 @@ def health():
         "device": engine_state.get("device", "not loaded"),
         "precision": engine_state.get("precision", "not loaded"),
         "quantization": engine_state.get("quant_engine", "not loaded"),
+        "engine": engine_state.get("engine", "not loaded"),
     }
 
 
@@ -149,6 +176,24 @@ def plan(features: TransactionFeatures, _auth=Depends(require_valid_service_toke
     prompt_text = tokenizer.apply_chat_template(
         build_messages(features.model_dump(exclude_none=True)), tokenize=False, add_generation_prompt=True
     )
+    if FAST_DECODING:
+        if not INFERENCE_LOCK.acquire(timeout=QUEUE_WAIT_S):
+            raise HTTPException(status_code=503, detail="planner busy")
+        try:
+            result = engine_state["fast"].plan(prompt_text)
+        finally:
+            INFERENCE_LOCK.release()
+        tools = result.selected_tools
+        return ToolPlanResponse(
+            selectedTools=tools,
+            # Composed, not generated: a model-written sentence cost ~15 extra forward passes
+            # and the trained model only ever parroted the heuristic's two reason strings.
+            reason=f"Fine-tuned local planner selected {len(tools)} tool(s): {', '.join(tools)}",
+            latency_ms=1000 * result.seconds,
+            engine="fast-constrained",
+            forward_passes=result.forward_passes,
+        )
+
     prompt_len = len(tokenizer(prompt_text, add_special_tokens=False)["input_ids"])
     decoder = ConstrainedToolPlanDecoder(
         tokenizer, prompt_len, engine_state["vocab_size"], max_new_tokens=MAX_NEW_TOKENS
@@ -165,4 +210,5 @@ def plan(features: TransactionFeatures, _auth=Depends(require_valid_service_toke
         # but surfacing a 500 with the raw text beats a silent bad response.
         raise HTTPException(status_code=500, detail=f"decoder produced invalid JSON: {result.text}") from exc
 
-    return ToolPlanResponse(selectedTools=parsed["selectedTools"], reason=parsed["reason"], latency_ms=latency_ms)
+    return ToolPlanResponse(selectedTools=parsed["selectedTools"], reason=parsed["reason"], latency_ms=latency_ms,
+                            engine="token-by-token-constrained", forward_passes=len(result.decode_seconds) + 1)
